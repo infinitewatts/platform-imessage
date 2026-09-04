@@ -277,8 +277,3 @@ struct SettingsView: View {
         }
     }
 }
-
-@available(macOS 13, *)
-#Preview {
-    SettingsView()
-}

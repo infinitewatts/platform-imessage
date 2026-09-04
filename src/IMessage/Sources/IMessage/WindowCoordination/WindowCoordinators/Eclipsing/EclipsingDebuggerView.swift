@@ -203,16 +203,3 @@ struct EclipsingDebuggerView: View {
         }
     }
 }
-
-@available(macOS 14, *)
-#Preview {
-    @Previewable var state = EclipsingDebuggerState(points: [
-        EclipsingPoint(position: CGPoint(x: 200, y: 100), label: "topleft"),
-        EclipsingPoint(position: CGPoint(x: 200 + 150, y: 100 + 75), label: "bottomright"),
-    ], rectangles: [
-        EclipsingRect(at: CGRect(x: 200, y: 100, width: 150, height: 75), label: "rectangle", color: NSColor.green.cgColor),
-    ])
-
-    EclipsingDebuggerView(state: state)
-        .frame(width: 1920 / 4, height: 1080 / 4)
-}
