@@ -13,6 +13,9 @@ private let loadAttachmentTimeout: TimeInterval = 60
 
 private final class PlatformAPIDatabase: @unchecked Sendable {
     private let state = Protected(State())
+    private let createIndexes: Bool
+
+    init(createIndexes: Bool) { self.createIndexes = createIndexes }
 
     func withDatabase<T>(_ action: (IMDatabase) throws -> T) throws -> T {
         try state.withLock { state in
@@ -49,7 +52,7 @@ private final class PlatformAPIDatabase: @unchecked Sendable {
         if let cached = state.database {
             return cached
         }
-        let db = try IMDatabase(createIndexes: true)
+        let db = try IMDatabase(createIndexes: createIndexes)
         state.database = db
         return db
     }
@@ -77,14 +80,15 @@ public final class PlatformAPI {
     private let accountID: String
     let errorMessageReporter: ReportErrorMessage?
 
-    private let database = PlatformAPIDatabase()
+    private let database: PlatformAPIDatabase
     private let currentUserCache = Protected<PlatformSDK.CurrentUser?>()
     private let dndUserIDs = Protected(Set<String>())
 
     private let threadObserveRequestToken = Protected<UUID?>()
     let hasBeenDisposed = Protected(false)
 
-    public init(accountID: String, reportErrorMessage: ReportErrorMessage? = nil, enforceSingleton: Bool = true) throws {
+    public init(accountID: String, reportErrorMessage: ReportErrorMessage? = nil, enforceSingleton: Bool = true, createDatabaseIndexes: Bool = true) throws {
+        self.database = PlatformAPIDatabase(createIndexes: createDatabaseIndexes)
         self.accountID = accountID
         self.errorMessageReporter = reportErrorMessage
         if enforceSingleton {
@@ -122,6 +126,13 @@ public final class PlatformAPI {
                 let currentUser = try Self.currentUser(db: db, cache: currentUserCache)
                 return try work(db, currentUser, accountID)
             }
+        }.value
+    }
+
+    func runApprovedDBQuery<T>(_ work: @escaping @Sendable (IMDatabase) throws -> T) async throws -> T {
+        let database = database
+        return try await Task.detached(priority: .userInitiated) {
+            try database.withDatabase(work)
         }.value
     }
 

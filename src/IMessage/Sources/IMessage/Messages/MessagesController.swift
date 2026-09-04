@@ -750,7 +750,7 @@ isMessagesAppResponsive=\(isMessagesAppResponsive)
         }
     }
 
-    func setReaction(threadID: String, messageCell: MessageCell, reaction: Reaction, on: Bool) throws {
+    func setReaction(threadID: String, messageCell: MessageCell, reaction: Reaction, on: Bool, allowMutationRetries: Bool = true) throws {
         let startTime = Date()
         defer { log.debug("setReaction took \(startTime.timeIntervalSinceNow * -1000)ms") }
 
@@ -816,7 +816,7 @@ isMessagesAppResponsive=\(isMessagesAppResponsive)
                 return buttons[idx]
             }()
 
-            try retry(withTimeout: 1.2, interval: 0.1) {
+            let applyReaction = {
                 let isSelected = try btn.isSelected()
                 if isSelected != on {
                     try btn.press()
@@ -825,6 +825,11 @@ isMessagesAppResponsive=\(isMessagesAppResponsive)
                         throw ErrorMessage("Could not react")
                     }
                 }
+            }
+            if allowMutationRetries {
+                try retry(withTimeout: 1.2, interval: 0.1, applyReaction)
+            } else {
+                try applyReaction()
             }
         }
     }
@@ -859,7 +864,7 @@ isMessagesAppResponsive=\(isMessagesAppResponsive)
     }
 
     // NOTE: message editing works even when the window is ordered out
-    func editMessage(threadID: String, messageCell: MessageCell, newText: String) throws {
+    func editMessage(threadID: String, messageCell: MessageCell, newText: String, allowMutationRetries: Bool = true) throws {
         guard isVenturaOrUp else {
             throw ErrorMessage("!isVenturaOrUp")
         }
@@ -911,10 +916,15 @@ isMessagesAppResponsive=\(isMessagesAppResponsive)
             if let editAction = try? messageAction(messageCell: messageCell, action: .edit) {
                 log.debug("found \"Edit\" message action")
 
-                try retry(withTimeout: 6.0, interval: 2.0, {
+                let applyEdit = {
                     try editAction()
                     try assignAndCommitEdit()
-                }, onError: onError)
+                }
+                if allowMutationRetries {
+                    try retry(withTimeout: 6.0, interval: 2.0, applyEdit, onError: onError)
+                } else {
+                    try applyEdit()
+                }
 
                 return
             }
@@ -923,12 +933,16 @@ isMessagesAppResponsive=\(isMessagesAppResponsive)
             // try $0.press(); $0.isFocused(assign: true); $0.isSelected(assign: true); keyPresser.commandE()
             try messageCell.showMenu()
             // retrying this too rapidly can cause the floating editor to appear more than once?
-            try retry(withTimeout: 6.0, interval: 2.0, {
+            let applyMenuEdit = { [self] in
                 Thread.sleep(forTimeInterval: Defaults.imessage.double(forKey: DefaultsKeys.editingDelayBeforePressingMenuItem))
                 try elements.menuEditItem.press()
-
                 try assignAndCommitEdit()
-            }, onError: onError)
+            }
+            if allowMutationRetries {
+                try retry(withTimeout: 6.0, interval: 2.0, applyMenuEdit, onError: onError)
+            } else {
+                try applyMenuEdit()
+            }
         }
     }
 
