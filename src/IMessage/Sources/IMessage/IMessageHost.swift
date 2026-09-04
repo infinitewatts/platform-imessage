@@ -111,6 +111,22 @@ public enum IMessageHost {
         }
     }
 
+    /// Must be the first bootstrap in a dedicated approval executor process.
+    /// Drops library logs before formatting or persistence, including OSLog.
+    public static func bootstrapForApprovedExecution() throws {
+        bootstrapLock.lock()
+        defer { bootstrapLock.unlock() }
+        guard !didBootstrap else { throw ApprovedExecutionError.alreadyBootstrapped }
+        didBootstrap = true
+        Preferences.setUseSecondaryInstance(false)
+        Preferences.configureHashing(defaultEnabled: false)
+        Preferences.isLoggingEnabled = false
+        Log.consoleOutputEnabled = false
+        Log.file = nil
+        Defaults.registerDefaults()
+        LoggingSystem.bootstrap { _ in SwiftLogNoOpLogHandler() }
+    }
+
     public static func stopEventWatching() async {
         EventWatcherLifecycle.shared.cancelWatchingIfNecessary(clearEventCallback: false)
     }
