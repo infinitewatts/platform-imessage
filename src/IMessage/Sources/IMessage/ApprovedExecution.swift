@@ -42,6 +42,13 @@ public struct ApprovedSnapshot: Sendable {
 }
 
 extension PlatformAPI {
+    /// Proves exact lookup only, never send readiness. Does not launch Messages or request consent.
+    public func approvedSendTarget(threadID: String) async throws -> ApprovedSendDiagnostic {
+        try await Self.onMessagesControllerQueue {
+            try OSA.approvedSend(threadID: threadID, text: nil)
+        }
+    }
+
     /// Uses raw immutable chat/message GUIDs, never aliases or contact equivalence.
     public func approvedSnapshot(threadID: String, messageID: String?, sinceRowID: Int? = nil) async throws -> ApprovedSnapshot {
         try await runApprovedDBQuery { db in
@@ -103,7 +110,7 @@ extension PlatformAPI {
         }
         if operation == "send" {
             // JXA targets the exact chat ID. Never fall back to another send path.
-            try await Self.onMessagesControllerQueue { try OSA.send(threadID: threadID, text: text!) }
+            _ = try await Self.onMessagesControllerQueue { try OSA.approvedSend(threadID: threadID, text: text!) }
             return
         }
         try await withMessagesController { controller in

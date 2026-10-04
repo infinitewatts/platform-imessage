@@ -2,6 +2,9 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// Public Carbon API unavailable to Swift. Resolves an exact PSN; never locates or launches by app identity.
+OSStatus IMPrivateSPIProcessIDForSerialNumber(const void *bytes, size_t length, pid_t *pid);
+
 NSObject *_Nullable IMPrivateSPIPluginPayloadCreate(NSData *payloadData,
                                                     NSString *bundleID,
                                                     NSString *messageGUID,
