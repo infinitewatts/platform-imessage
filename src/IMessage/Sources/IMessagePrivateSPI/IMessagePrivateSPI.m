@@ -1,5 +1,13 @@
 #import "IMessagePrivateSPI.h"
+#import <ApplicationServices/ApplicationServices.h>
 #import <objc/message.h>
+
+OSStatus IMPrivateSPIProcessIDForSerialNumber(const void *bytes, size_t length, pid_t *pid) {
+    if (length != sizeof(ProcessSerialNumber)) return errAEWrongDataType;
+    ProcessSerialNumber psn;
+    memcpy(&psn, bytes, sizeof(psn));
+    return GetProcessPID(&psn, pid);
+}
 
 NSObject *_Nullable IMPrivateSPIPluginPayloadCreate(NSData *payloadData,
                                                     NSString *bundleID,
