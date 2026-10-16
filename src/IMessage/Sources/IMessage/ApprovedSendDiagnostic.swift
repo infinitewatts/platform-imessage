@@ -28,6 +28,43 @@ public struct ApprovedSendDiagnostic: Error, Sendable {
     }
 }
 
+/// A direct chat proven from chat.db. Messages scripting exposes only the chats it has
+/// loaded, so an exact chat that is missing may resolve through its one participant.
+public struct ApprovedDirectTarget: Sendable, Equatable, Encodable {
+    public let handle: String
+    /// Messages scripting account service type: "iMessage" or "SMS".
+    public let service: String
+
+    public init?(threadID: String, identifier: String?, serviceName: String?, style: Int?, handles: [String]) {
+        let parts = threadID.split(separator: ";", omittingEmptySubsequences: false).map(String.init)
+        // 45 is a one-to-one chat; groups (43) never qualify.
+        guard parts.count == 3, parts[1] == "-", style == 45, let identifier, !identifier.isEmpty,
+              parts[2] == identifier, handles == [identifier], let serviceName,
+              parts[0] == "any" || parts[0] == serviceName else { return nil }
+        switch serviceName {
+        case "iMessage": service = "iMessage"
+        // The Mac sends RCS conversations through the iPhone as SMS when RCS is unavailable.
+        case "SMS", "RCS": service = "SMS"
+        default: return nil
+        }
+        handle = identifier
+    }
+}
+
+/// Encodes as the JSON array `[threadID, text, direct]`, with null for absent values.
+private struct ApprovedScriptArguments: Encodable {
+    let threadID: String
+    let text: String?
+    let direct: ApprovedDirectTarget?
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.unkeyedContainer()
+        try container.encode(threadID)
+        if let text { try container.encode(text) } else { try container.encodeNil() }
+        if let direct { try container.encode(direct) } else { try container.encodeNil() }
+    }
+}
+
 /// Retains the verified process identity, rather than resolving the app again by path.
 struct ApprovedOSATarget {
     let processIdentifier: pid_t
@@ -51,7 +88,7 @@ private final class ApprovedOSASendContext {
 extension OSA {
     /// Internal closures provide an offline seam; production uses the same gate and program.
     static func approvedSend(
-        threadID: String, text: String?,
+        threadID: String, text: String?, direct: ApprovedDirectTarget? = nil,
         permissionCheck: () throws -> ApprovedOSATarget = approvedSendPermission,
         execute: (String, ApprovedOSATarget) throws -> String = { try executeApprovedScript($0, target: $1) }
     ) throws -> ApprovedSendDiagnostic {
@@ -64,7 +101,7 @@ extension OSA {
             throw ApprovedSendDiagnostic(stage: .permission, appleEventCode: -600)
         }
         do {
-            let source = try approvedSendScript(threadID: threadID, text: text, processIdentifier: target.processIdentifier)
+            let source = try approvedSendScript(threadID: threadID, text: text, direct: direct, processIdentifier: target.processIdentifier)
             let result = try execute(source, target)
             guard let data = result.data(using: .utf8),
                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -95,22 +132,41 @@ extension OSA {
         return ApprovedOSATarget(processIdentifier: pid, isRunning: { !application.isTerminated })
     }
 
-    static func approvedSendScript(threadID: String, text: String?, processIdentifier: pid_t) throws -> String {
+    static func approvedSendScript(threadID: String, text: String?, direct: ApprovedDirectTarget? = nil,
+                                   processIdentifier: pid_t) throws -> String {
         // JSON literals preserve the full GUID and text without service normalization or interpolation.
-        let arguments = try jsonStringify([threadID, text])
+        let arguments = try jsonStringify(ApprovedScriptArguments(threadID: threadID, text: text, direct: direct))
             .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
             .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
         return """
         (() => {
-            const [tid, txt] = \(arguments);
+            const [tid, txt, direct] = \(arguments);
             let stage = 'script';
             try {
                 stage = 'permission';
                 const Messages = Application(\(processIdentifier));
                 if (!Messages.running()) return JSON.stringify({stage, appleEventCode: -600});
                 stage = 'target_lookup';
-                const to = Messages.chats.byId(tid)();
-                if (!to || to.id() !== tid) return JSON.stringify({stage});
+                let to, missing = false;
+                try { to = Messages.chats.byId(tid)(); }
+                catch (error) {
+                    // Only an unloaded verified direct chat may resolve through its participant.
+                    let number;
+                    try { number = error.errorNumber; } catch (_) {}
+                    if (direct === null || number !== -1728) throw error;
+                    missing = true;
+                }
+                if (!missing) {
+                    if (!to || to.id() !== tid) return JSON.stringify({stage});
+                } else {
+                    const accounts = Messages.accounts().filter(account => {
+                        try { return account.serviceType() === direct.service && account.enabled() === true; }
+                        catch (_) { return false; }
+                    });
+                    if (accounts.length !== 1) return JSON.stringify({stage, appleEventCode: -1728});
+                    to = accounts[0].participants.byName(direct.handle);
+                    if (to.handle() !== direct.handle) return JSON.stringify({stage});
+                }
                 \(text == nil ? "" : "stage = 'send'; Messages.send(txt, { to });")
                 return JSON.stringify({stage: 'complete'});
             } catch (error) {
