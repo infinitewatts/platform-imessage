@@ -44,8 +44,19 @@ public struct ApprovedSnapshot: Sendable {
 extension PlatformAPI {
     /// Proves exact lookup only, never send readiness. Does not launch Messages or request consent.
     public func approvedSendTarget(threadID: String) async throws -> ApprovedSendDiagnostic {
-        try await Self.onMessagesControllerQueue {
-            try OSA.approvedSend(threadID: threadID, text: nil)
+        let direct = await approvedDirectTarget(threadID: threadID)
+        return try await Self.onMessagesControllerQueue {
+            try OSA.approvedSend(threadID: threadID, text: nil, direct: direct)
+        }
+    }
+
+    /// Nil unless chat.db proves an exact one-to-one chat with a single matching participant.
+    /// A read failure also yields nil, leaving only the exact chat lookup.
+    func approvedDirectTarget(threadID: String) async -> ApprovedDirectTarget? {
+        try? await runApprovedDBQuery { db in
+            guard let chat = try db.approvedChatRow(guid: threadID) else { return nil }
+            return ApprovedDirectTarget(threadID: threadID, identifier: chat.identifier, serviceName: chat.serviceName,
+                                        style: chat.style, handles: try db.handles(inChatWithGUID: threadID).map(\.id))
         }
     }
 
@@ -109,8 +120,10 @@ extension PlatformAPI {
             }
         }
         if operation == "send" {
-            // JXA targets the exact chat ID. Never fall back to another send path.
-            _ = try await Self.onMessagesControllerQueue { try OSA.approvedSend(threadID: threadID, text: text!) }
+            // JXA targets the exact chat ID, or only its verified direct participant when
+            // Messages has not loaded that chat. Never fall back to another send path.
+            let direct = await approvedDirectTarget(threadID: threadID)
+            _ = try await Self.onMessagesControllerQueue { try OSA.approvedSend(threadID: threadID, text: text!, direct: direct) }
             return
         }
         try await withMessagesController { controller in

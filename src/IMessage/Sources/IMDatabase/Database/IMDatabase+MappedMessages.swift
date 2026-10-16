@@ -140,6 +140,15 @@ public extension IMDatabase {
         }.first
     }
 
+    /// Exact chat row metadata for approved direct-chat verification. Never matches aliases.
+    func approvedChatRow(guid: String) throws -> (identifier: String?, serviceName: String?, style: Int?)? {
+        let statement = try cachedStatement(forEscapedSQL: "SELECT chat_identifier, service_name, style FROM chat WHERE guid = ?").reset()
+        try statement.bind(guid)
+        return try statement.mapRowsUntilDone { row in
+            (try row[0].optional(String.self), try row[1].optional(String.self), try row[2].optionalConverting(Int.self))
+        }.first
+    }
+
     func mappedMessageRow(guid: String) throws -> MappedMessageRow? {
         try mappedMessageRows(guids: [guid]).first
     }
