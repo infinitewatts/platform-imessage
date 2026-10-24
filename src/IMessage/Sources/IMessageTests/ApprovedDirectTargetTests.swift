@@ -30,6 +30,7 @@ private let smsDirect = ApprovedDirectTarget(threadID: directGUID, identifier: d
 
 /// Runs the approved program against a stub Messages; no application or Apple events are used.
 private func runDirect(
+    threadID: String = directGUID, newRecipient: Bool = false,
     text: String? = directText, direct: ApprovedDirectTarget? = smsDirect,
     lookup: String = "throw Object.assign(new Error('private'), { errorNumber: -1728 });",
     accounts: String = "[account('SMS', true, '+12025550123'), account('iMessage', true, '+12025550123'), account('RCS', false, '+12025550123')]"
@@ -37,7 +38,7 @@ private func runDirect(
     var counts = (lookups: 0, accountReads: 0, sends: 0)
     let diagnostic: ApprovedSendDiagnostic
     do {
-        diagnostic = try OSA.approvedSend(threadID: directGUID, text: text, direct: direct, permissionCheck: { offlineTarget }, execute: { source, target in
+        diagnostic = try OSA.approvedSend(threadID: threadID, text: text, direct: direct, newRecipient: newRecipient, permissionCheck: { offlineTarget }, execute: { source, target in
             let program = """
             (() => {
             var lookups = 0, accountReads = 0, sends = 0;
@@ -114,4 +115,42 @@ private func runDirect(
     let renamed = try runDirect(accounts: "[{ serviceType: () => 'SMS', enabled: () => true, participants: { byName: () => ({ handle: () => '+12025550124' }) } }]")
     #expect(renamed.diagnostic.stage == .targetLookup)
     #expect(renamed.sends == 0)
+}
+
+@Test func newRecipientRequiresUSNumberWithNoSoleParticipantChat() {
+    let fresh = ApprovedDirectTarget(newRecipient: directHandle, existingChats: [])
+    #expect(fresh?.handle == directHandle)
+    #expect(fresh?.service == "SMS")
+    for chat in [ApprovedDirectChat(guid: directGUID, style: 45, serviceName: "SMS"),
+                 ApprovedDirectChat(guid: "iMessage;-;+12025550123", style: 45, serviceName: "iMessage"),
+                 ApprovedDirectChat(guid: "chat123", style: 43, serviceName: "iMessage")] {
+        #expect(ApprovedDirectTarget(newRecipient: directHandle, existingChats: [chat]) == nil)
+    }
+    for number in ["+12025550123"] { #expect(ApprovedDirectTarget.isUSNumber(number)) }
+    for number in ["12025550123", "+1202555012", "+120255501234", "+11025550123", "+10025550123",
+                   "+12021550123", "+12020550123", "+22025550123", "+1202555012a", "+1202555012\u{0661}",
+                   "+1 2025550123", "", "tel:+12025550123", "person@example.com"] {
+        #expect(!ApprovedDirectTarget.isUSNumber(number))
+        #expect(ApprovedDirectTarget(newRecipient: number, existingChats: []) == nil)
+    }
+}
+
+@Test func newRecipientSendsOnlyThroughItsParticipant() throws {
+    let fresh = try #require(ApprovedDirectTarget(newRecipient: directHandle, existingChats: []))
+    // byId is never consulted: a lookup would record and the stub throws if reached.
+    let sent = try runDirect(threadID: "", newRecipient: true, direct: fresh, lookup: "throw new Error('looked up');")
+    #expect(sent.diagnostic.stage == .complete)
+    #expect((sent.lookups, sent.accountReads, sent.sends) == (0, 1, 1))
+    let probe = try runDirect(threadID: "", newRecipient: true, text: nil, direct: fresh)
+    #expect(probe.diagnostic.stage == .complete)
+    #expect((probe.lookups, probe.accountReads, probe.sends) == (0, 1, 0))
+    // No target, a GUID alongside the flag, or a lone iMessage account never sends.
+    for result in [try runDirect(threadID: "", newRecipient: true, direct: nil),
+                   try runDirect(threadID: directGUID, newRecipient: true, direct: fresh),
+                   try runDirect(threadID: "", newRecipient: true, direct: fresh,
+                                 accounts: "[account('iMessage', true, '+12025550123')]"),
+                   try runDirect(threadID: "", newRecipient: false, direct: fresh)] {
+        #expect(result.diagnostic.stage == .targetLookup)
+        #expect(result.sends == 0)
+    }
 }

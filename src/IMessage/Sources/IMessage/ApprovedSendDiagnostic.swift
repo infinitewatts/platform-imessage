@@ -49,19 +49,48 @@ public struct ApprovedDirectTarget: Sendable, Equatable, Encodable {
         }
         handle = identifier
     }
+
+    /// A first-time US recipient: chat.db must show no chat whose sole participant is this
+    /// handle, on any service. New conversations send only as a text message through the iPhone.
+    public init?(newRecipient: String, existingChats: [ApprovedDirectChat]) {
+        guard Self.isUSNumber(newRecipient), existingChats.isEmpty else { return nil }
+        handle = newRecipient
+        service = "SMS"
+    }
+
+    /// `+1` and a ten-digit NANP number in ASCII digits; area code and exchange never start with 0 or 1.
+    public static func isUSNumber(_ value: String) -> Bool {
+        let digits = Array(value.utf8)
+        guard digits.count == 12, digits[0] == UInt8(ascii: "+"), digits[1] == UInt8(ascii: "1") else { return false }
+        let number = digits[2...]
+        guard number.allSatisfy({ (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0) }) else { return false }
+        return number[2] >= UInt8(ascii: "2") && number[5] >= UInt8(ascii: "2")
+    }
 }
 
-/// Encodes as the JSON array `[threadID, text, direct]`, with null for absent values.
+/// A chat whose sole participant is one handle, of any style or service.
+public struct ApprovedDirectChat: Sendable, Equatable {
+    public let guid: String
+    public let style: Int?
+    public let serviceName: String?
+    public init(guid: String, style: Int?, serviceName: String?) {
+        self.guid = guid; self.style = style; self.serviceName = serviceName
+    }
+}
+
+/// Encodes as the JSON array `[threadID, text, direct, newRecipient]`, with null for absent values.
 private struct ApprovedScriptArguments: Encodable {
     let threadID: String
     let text: String?
     let direct: ApprovedDirectTarget?
+    let newRecipient: Bool
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.unkeyedContainer()
         try container.encode(threadID)
         if let text { try container.encode(text) } else { try container.encodeNil() }
         if let direct { try container.encode(direct) } else { try container.encodeNil() }
+        try container.encode(newRecipient)
     }
 }
 
@@ -88,7 +117,7 @@ private final class ApprovedOSASendContext {
 extension OSA {
     /// Internal closures provide an offline seam; production uses the same gate and program.
     static func approvedSend(
-        threadID: String, text: String?, direct: ApprovedDirectTarget? = nil,
+        threadID: String, text: String?, direct: ApprovedDirectTarget? = nil, newRecipient: Bool = false,
         permissionCheck: () throws -> ApprovedOSATarget = approvedSendPermission,
         execute: (String, ApprovedOSATarget) throws -> String = { try executeApprovedScript($0, target: $1) }
     ) throws -> ApprovedSendDiagnostic {
@@ -96,12 +125,16 @@ extension OSA {
         do { target = try permissionCheck() }
         catch let diagnostic as ApprovedSendDiagnostic { throw diagnostic }
         catch { throw ApprovedSendDiagnostic(stage: .permission) }
-        guard !threadID.isEmpty else { throw ApprovedSendDiagnostic(stage: .targetLookup) }
+        // A new recipient has no chat yet: it names only its verified participant, never a GUID.
+        guard newRecipient ? threadID.isEmpty && direct != nil : !threadID.isEmpty else {
+            throw ApprovedSendDiagnostic(stage: .targetLookup)
+        }
         guard target.processIdentifier > 0, target.isRunning() else {
             throw ApprovedSendDiagnostic(stage: .permission, appleEventCode: -600)
         }
         do {
-            let source = try approvedSendScript(threadID: threadID, text: text, direct: direct, processIdentifier: target.processIdentifier)
+            let source = try approvedSendScript(threadID: threadID, text: text, direct: direct, newRecipient: newRecipient,
+                                                processIdentifier: target.processIdentifier)
             let result = try execute(source, target)
             guard let data = result.data(using: .utf8),
                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -133,14 +166,15 @@ extension OSA {
     }
 
     static func approvedSendScript(threadID: String, text: String?, direct: ApprovedDirectTarget? = nil,
-                                   processIdentifier: pid_t) throws -> String {
+                                   newRecipient: Bool = false, processIdentifier: pid_t) throws -> String {
         // JSON literals preserve the full GUID and text without service normalization or interpolation.
-        let arguments = try jsonStringify(ApprovedScriptArguments(threadID: threadID, text: text, direct: direct))
+        let arguments = try jsonStringify(ApprovedScriptArguments(threadID: threadID, text: text, direct: direct,
+                                                                       newRecipient: newRecipient))
             .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
             .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
         return """
         (() => {
-            const [tid, txt, direct] = \(arguments);
+            const [tid, txt, direct, fresh] = \(arguments);
             let stage = 'script';
             try {
                 stage = 'permission';
@@ -148,7 +182,11 @@ extension OSA {
                 if (!Messages.running()) return JSON.stringify({stage, appleEventCode: -600});
                 stage = 'target_lookup';
                 let to, missing = false;
-                try { to = Messages.chats.byId(tid)(); }
+                if (fresh === true) {
+                    // A first-time recipient has no chat to look up; only its participant may be used.
+                    if (direct === null || tid !== '') return JSON.stringify({stage});
+                    missing = true;
+                } else try { to = Messages.chats.byId(tid)(); }
                 catch (error) {
                     // Only an unloaded verified direct chat may resolve through its participant.
                     let number;

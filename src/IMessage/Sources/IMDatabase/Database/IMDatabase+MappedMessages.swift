@@ -149,6 +149,23 @@ public extension IMDatabase {
         }.first
     }
 
+    /// Chats whose only participant is exactly `handle`, of any style or service. Also matches a
+    /// chat whose identifier is the handle but has no participant rows, so neither shape is missed.
+    func approvedSoleParticipantChats(handle: String) throws -> [(guid: String, style: Int?, serviceName: String?)] {
+        let statement = try cachedStatement(forEscapedSQL: """
+        SELECT c.guid, c.style, c.service_name
+        FROM chat AS c
+        WHERE (SELECT COUNT(*) FROM chat_handle_join AS j WHERE j.chat_id = c.ROWID) = 1
+          AND EXISTS (SELECT 1 FROM chat_handle_join AS j INNER JOIN handle AS h ON h.ROWID = j.handle_id
+                      WHERE j.chat_id = c.ROWID AND h.id = ?)
+           OR (c.chat_identifier = ? AND NOT EXISTS (SELECT 1 FROM chat_handle_join AS j WHERE j.chat_id = c.ROWID))
+        """).reset()
+        try statement.bind(handle, handle)
+        return try statement.mapRowsUntilDone { row in
+            (try row[0].expect(String.self), try row[1].optionalConverting(Int.self), try row[2].optional(String.self))
+        }
+    }
+
     func mappedMessageRow(guid: String) throws -> MappedMessageRow? {
         try mappedMessageRows(guids: [guid]).first
     }
