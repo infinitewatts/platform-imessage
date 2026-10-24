@@ -5,7 +5,8 @@ import Testing
 @Test func approvedEvidenceKeepsExactDatabaseDestinationAndOwnership() throws {
     let row = try MappedMessageRow(object: ["ROWID": 12, "guid": "fixture-message", "threadID": "actual-thread",
                                           "is_from_me": 0, "error": 7, "date_edited": 123,
-                                          "associated_message_guid": "p:0/fixture-target", "associated_message_type": 2001])
+                                          "associated_message_guid": "p:0/fixture-target", "associated_message_type": 2001,
+                                          "service": "SMS"])
     let evidence = PlatformAPI.approvedEvidence(row: row, text: "fixture", sent: false, plainSinglePart: true)
     #expect(evidence.messageID == "fixture-message")
     #expect(evidence.threadID == "actual-thread")
@@ -15,6 +16,7 @@ import Testing
     #expect(evidence.edited == 123)
     #expect(evidence.associatedID == "p:0/fixture-target")
     #expect(evidence.associatedType == 2001)
+    #expect(evidence.service == "SMS")
 }
 
 @Test func approvedEvidenceRetractionRequiresExplicitMarker() throws {

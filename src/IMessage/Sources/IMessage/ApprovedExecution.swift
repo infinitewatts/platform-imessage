@@ -2,7 +2,7 @@ import Foundation
 import IMDatabase
 
 public enum ApprovedExecutionError: Error {
-    case alreadyBootstrapped, invalidTarget, invalidOperation
+    case alreadyBootstrapped, invalidTarget, invalidOperation, threadExists
 }
 
 /// Evidence is sensitive process-local data. Never log or serialize it to diagnostics.
@@ -19,14 +19,17 @@ public struct ApprovedMessageEvidence: Sendable {
     public let plainSinglePart: Bool
     public let associatedID: String?
     public let associatedType: Int
+    /// The message row's service, such as "iMessage", "SMS" or "RCS".
+    public let service: String?
 
     public init(rowID: Int, messageID: String, threadID: String, text: String?, owned: Bool,
                 sent: Bool, error: Int = 0, edited: Int = 0, retracted: Bool = false,
-                plainSinglePart: Bool = true, associatedID: String? = nil, associatedType: Int = 0) {
+                plainSinglePart: Bool = true, associatedID: String? = nil, associatedType: Int = 0,
+                service: String? = nil) {
         self.rowID = rowID; self.messageID = messageID; self.threadID = threadID; self.text = text
         self.owned = owned; self.sent = sent; self.error = error; self.edited = edited
         self.retracted = retracted; self.plainSinglePart = plainSinglePart
-        self.associatedID = associatedID; self.associatedType = associatedType
+        self.associatedID = associatedID; self.associatedType = associatedType; self.service = service
     }
 }
 
@@ -38,6 +41,17 @@ public struct ApprovedSnapshot: Sendable {
     public let outgoing: [ApprovedMessageEvidence]
     public init(threadExists: Bool, watermark: Int, target: ApprovedMessageEvidence?, outgoing: [ApprovedMessageEvidence]) {
         self.threadExists = threadExists; self.watermark = watermark; self.target = target; self.outgoing = outgoing
+    }
+}
+
+/// Before and after a first-time-recipient send. Chats are those whose sole participant is the handle.
+public struct ApprovedNewRecipientSnapshot: Sendable {
+    public let directChats: [ApprovedDirectChat]
+    public let watermark: Int
+    /// All outgoing rows after the watermark, including other destinations.
+    public let outgoing: [ApprovedMessageEvidence]
+    public init(directChats: [ApprovedDirectChat], watermark: Int, outgoing: [ApprovedMessageEvidence]) {
+        self.directChats = directChats; self.watermark = watermark; self.outgoing = outgoing
     }
 }
 
@@ -60,19 +74,69 @@ extension PlatformAPI {
         }
     }
 
+    /// Read failures throw: they never mean "no chats".
+    public func approvedDirectChats(handle: String) async throws -> [ApprovedDirectChat] {
+        try await runApprovedDBQuery { db in
+            try db.approvedSoleParticipantChats(handle: handle).map {
+                ApprovedDirectChat(guid: $0.guid, style: $0.style, serviceName: $0.serviceName)
+            }
+        }
+    }
+
+    /// Proves only that Messages resolves the first-time recipient's participant; never sends.
+    public func approvedNewRecipientTarget(handle: String) async throws -> ApprovedSendDiagnostic {
+        let target = try await approvedNewRecipient(handle: handle)
+        return try await Self.onMessagesControllerQueue {
+            try OSA.approvedSend(threadID: "", text: nil, direct: target, newRecipient: true)
+        }
+    }
+
+    func approvedNewRecipient(handle: String) async throws -> ApprovedDirectTarget {
+        guard ApprovedDirectTarget.isUSNumber(handle) else { throw ApprovedExecutionError.invalidTarget }
+        guard let target = ApprovedDirectTarget(newRecipient: handle, existingChats: try await approvedDirectChats(handle: handle)) else {
+            throw ApprovedExecutionError.threadExists
+        }
+        return target
+    }
+
+    public func approvedNewRecipientSnapshot(handle: String, sinceRowID: Int? = nil) async throws -> ApprovedNewRecipientSnapshot {
+        try await runApprovedDBQuery { db in
+            let watermark = try db.lastMessageRowID()
+            let chats = try db.approvedSoleParticipantChats(handle: handle).map {
+                ApprovedDirectChat(guid: $0.guid, style: $0.style, serviceName: $0.serviceName)
+            }
+            return ApprovedNewRecipientSnapshot(directChats: chats, watermark: watermark,
+                                                outgoing: try Self.approvedOutgoing(db: db, since: sinceRowID))
+        }
+    }
+
+    /// One first-time-recipient send attempt. chat.db is checked again here, immediately before
+    /// dispatch. The caller must authorize, preflight, serialize and confirm; never retry throws.
+    public func dispatchApprovedNewRecipientSend(handle: String, text: String) async throws {
+        guard !text.isEmpty else { throw ApprovedExecutionError.invalidOperation }
+        let target = try await approvedNewRecipient(handle: handle)
+        _ = try await Self.onMessagesControllerQueue {
+            try OSA.approvedSend(threadID: "", text: text, direct: target, newRecipient: true)
+        }
+    }
+
+    static func approvedOutgoing(db: IMDatabase, since: Int?) throws -> [ApprovedMessageEvidence] {
+        try since.map { since in
+            try db.sentMessageIDs(since: since).map { candidate in
+                guard let evidence = try approvedEvidence(db: db, guid: candidate.guid) else {
+                    throw ApprovedExecutionError.invalidTarget
+                }
+                return evidence
+            }
+        } ?? []
+    }
+
     /// Uses raw immutable chat/message GUIDs, never aliases or contact equivalence.
     public func approvedSnapshot(threadID: String, messageID: String?, sinceRowID: Int? = nil) async throws -> ApprovedSnapshot {
         try await runApprovedDBQuery { db in
             let watermark = try db.lastMessageRowID()
             let target = try messageID.flatMap { try Self.approvedEvidence(db: db, guid: $0) }
-            let outgoing: [ApprovedMessageEvidence] = try sinceRowID.map { since in
-                try db.sentMessageIDs(since: since).map { candidate in
-                    guard let evidence = try Self.approvedEvidence(db: db, guid: candidate.guid) else {
-                        throw ApprovedExecutionError.invalidTarget
-                    }
-                    return evidence
-                }
-            } ?? []
+            let outgoing = try Self.approvedOutgoing(db: db, since: sinceRowID)
             return ApprovedSnapshot(threadExists: try db.mappedChatRowID(guid: threadID) != nil,
                                     watermark: watermark, target: target, outgoing: outgoing)
         }
@@ -97,7 +161,7 @@ extension PlatformAPI {
                                        error: row.error, edited: row.dateEdited ?? 0,
                                        retracted: (row.dateRetracted ?? 0) > 0 || row.wasDetonated == 1,
                                        plainSinglePart: plainSinglePart, associatedID: row.associatedMessageGUID,
-                                       associatedType: row.associatedMessageType)
+                                       associatedType: row.associatedMessageType, service: row.service)
     }
 
     /// One mutation attempt. The caller must authorize, preflight, serialize and confirm.
