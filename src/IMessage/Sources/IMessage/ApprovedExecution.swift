@@ -21,15 +21,53 @@ public struct ApprovedMessageEvidence: Sendable {
     public let associatedType: Int
     /// The message row's service, such as "iMessage", "SMS" or "RCS".
     public let service: String?
+    /// Attachments joined to the message row; empty unless the row has any.
+    public let attachments: [ApprovedAttachmentEvidence]
 
     public init(rowID: Int, messageID: String, threadID: String, text: String?, owned: Bool,
                 sent: Bool, error: Int = 0, edited: Int = 0, retracted: Bool = false,
                 plainSinglePart: Bool = true, associatedID: String? = nil, associatedType: Int = 0,
-                service: String? = nil) {
+                service: String? = nil, attachments: [ApprovedAttachmentEvidence] = []) {
+        self.attachments = attachments
         self.rowID = rowID; self.messageID = messageID; self.threadID = threadID; self.text = text
         self.owned = owned; self.sent = sent; self.error = error; self.edited = edited
         self.retracted = retracted; self.plainSinglePart = plainSinglePart
         self.associatedID = associatedID; self.associatedType = associatedType; self.service = service
+    }
+}
+
+/// One chat.db attachment row. Sensitive process-local data: never log it.
+public struct ApprovedAttachmentEvidence: Sendable, Equatable {
+    public let guid: String
+    /// Absolute path from chat.db `filename`, with a leading `~` expanded to the Messages user home.
+    /// Nil when chat.db has no filename or it is not absolute after expansion.
+    public let filePath: String?
+    public let transferName: String?
+    public let totalBytes: Int
+    /// IMFileTransferState raw value; 5 is finished.
+    public let transferState: Int
+    public let isOutgoing: Bool
+    public let mimeType: String?
+
+    public init(guid: String, filePath: String?, transferName: String?, totalBytes: Int,
+                transferState: Int, isOutgoing: Bool, mimeType: String?) {
+        self.guid = guid; self.filePath = filePath; self.transferName = transferName
+        self.totalBytes = totalBytes; self.transferState = transferState
+        self.isOutgoing = isOutgoing; self.mimeType = mimeType
+    }
+
+    static func resolvedPath(_ filename: String?, home: String) -> String? {
+        guard let filename, !filename.isEmpty else { return nil }
+        let path: String
+        if filename == "~" { path = home }
+        else if filename.hasPrefix("~/") { path = home + "/" + filename.dropFirst(2) }
+        else { path = filename }
+        return path.hasPrefix("/") ? path : nil
+    }
+
+    init(row: ApprovedAttachmentRow, home: String) {
+        self.init(guid: row.guid, filePath: Self.resolvedPath(row.filename, home: home), transferName: row.transferName,
+                  totalBytes: row.totalBytes, transferState: row.transferState, isOutgoing: row.isOutgoing, mimeType: row.mimeType)
     }
 }
 
@@ -152,16 +190,39 @@ extension PlatformAPI {
         let plainBody = message.attributedBody == nil ? (text != nil && !text!.contains("\u{fffc}")) :
             (parts.count == 1 && parts.first?.index.rawValue == 0 && parts.first?.replacedWithObject == false)
         let plain = plainBody && row.balloonBundleID == nil
-        return approvedEvidence(row: row, text: text, sent: message.isSent, plainSinglePart: plain)
+        let attachments = try db.approvedAttachmentRows(messageRowID: row.rowID).map {
+            ApprovedAttachmentEvidence(row: $0, home: NSHomeDirectory())
+        }
+        return approvedEvidence(row: row, text: text, sent: message.isSent, plainSinglePart: plain, attachments: attachments)
     }
 
-    static func approvedEvidence(row: MappedMessageRow, text: String?, sent: Bool, plainSinglePart: Bool) -> ApprovedMessageEvidence {
+    static func approvedEvidence(row: MappedMessageRow, text: String?, sent: Bool, plainSinglePart: Bool,
+                                 attachments: [ApprovedAttachmentEvidence] = []) -> ApprovedMessageEvidence {
         ApprovedMessageEvidence(rowID: row.rowID, messageID: row.guid, threadID: row.threadID ?? "",
                                        text: text, owned: row.isFromMe == 1, sent: sent,
                                        error: row.error, edited: row.dateEdited ?? 0,
                                        retracted: (row.dateRetracted ?? 0) > 0 || row.wasDetonated == 1,
                                        plainSinglePart: plainSinglePart, associatedID: row.associatedMessageGUID,
-                                       associatedType: row.associatedMessageType, service: row.service)
+                                       associatedType: row.associatedMessageType, service: row.service,
+                                       attachments: attachments)
+    }
+
+    /// Absolute, non-symlink regular file; anything else throws before any dispatch.
+    static func validatedApprovedFilePath(_ filePath: String) throws {
+        guard filePath.hasPrefix("/"), !filePath.utf8.contains(0) else { throw ApprovedExecutionError.invalidOperation }
+        var info = stat()
+        guard lstat(filePath, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { throw ApprovedExecutionError.invalidOperation }
+    }
+
+    /// One owner-approved single-file send to a proven direct chat, over the same PID-addressed JXA
+    /// transport as text. The adapter owns staging and hashing. Never retry throws and never use another path.
+    public func dispatchApprovedFileSend(threadID: String, filePath: String) async throws {
+        guard !threadID.isEmpty else { throw ApprovedExecutionError.invalidOperation }
+        try Self.validatedApprovedFilePath(filePath)
+        guard let direct = await approvedDirectTarget(threadID: threadID) else { throw ApprovedExecutionError.invalidTarget }
+        _ = try await Self.onMessagesControllerQueue {
+            try OSA.approvedSend(threadID: threadID, text: nil, direct: direct, filePath: filePath)
+        }
     }
 
     /// One mutation attempt. The caller must authorize, preflight, serialize and confirm.
