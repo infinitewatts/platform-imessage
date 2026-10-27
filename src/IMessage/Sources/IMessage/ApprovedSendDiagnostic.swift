@@ -181,6 +181,34 @@ extension OSA {
         if let filePath, filePath.isEmpty { throw ApprovedSendDiagnostic(stage: .script) }
         let sendStatement = filePath != nil ? "stage = 'send'; Messages.send(Path(fp), { to });"
             : text == nil ? "" : "stage = 'send'; Messages.send(txt, { to });"
+        // File mode resolves only the exact chat: no participant or account fallback exists in its script,
+        // so an unloaded chat throws to the target_lookup stage and nothing is sent.
+        let lookup = filePath != nil ? """
+                } else {
+                    to = Messages.chats.byId(tid)();
+                    if (!to || to.id() !== tid) return JSON.stringify({stage});
+                }
+        """ : """
+                        } else try { to = Messages.chats.byId(tid)(); }
+                catch (error) {
+                    // Only an unloaded verified direct chat may resolve through its participant.
+                    let number;
+                    try { number = error.errorNumber; } catch (_) {}
+                    if (direct === null || number !== -1728) throw error;
+                    missing = true;
+                }
+                if (!missing) {
+                    if (!to || to.id() !== tid) return JSON.stringify({stage});
+                } else {
+                    const accounts = Messages.accounts().filter(account => {
+                        try { return account.serviceType() === direct.service && account.enabled() === true; }
+                        catch (_) { return false; }
+                    });
+                    if (accounts.length !== 1) return JSON.stringify({stage, appleEventCode: -1728});
+                    to = accounts[0].participants.byName(direct.handle);
+                    if (to.handle() !== direct.handle) return JSON.stringify({stage});
+                }
+        """
         // JSON literals preserve the full GUID and text without service normalization or interpolation.
         let arguments = try jsonStringify(ApprovedScriptArguments(threadID: threadID, text: text, direct: direct,
                                                                        newRecipient: newRecipient, filePath: filePath))
@@ -202,25 +230,7 @@ extension OSA {
                     // A first-time recipient has no chat to look up; only its participant may be used.
                     if (direct === null || tid !== '') return JSON.stringify({stage});
                     missing = true;
-                } else try { to = Messages.chats.byId(tid)(); }
-                catch (error) {
-                    // Only an unloaded verified direct chat may resolve through its participant.
-                    let number;
-                    try { number = error.errorNumber; } catch (_) {}
-                    if (direct === null || number !== -1728) throw error;
-                    missing = true;
-                }
-                if (!missing) {
-                    if (!to || to.id() !== tid) return JSON.stringify({stage});
-                } else {
-                    const accounts = Messages.accounts().filter(account => {
-                        try { return account.serviceType() === direct.service && account.enabled() === true; }
-                        catch (_) { return false; }
-                    });
-                    if (accounts.length !== 1) return JSON.stringify({stage, appleEventCode: -1728});
-                    to = accounts[0].participants.byName(direct.handle);
-                    if (to.handle() !== direct.handle) return JSON.stringify({stage});
-                }
+                \(lookup)
                 \(sendStatement)
                 return JSON.stringify({stage: 'complete'});
             } catch (error) {

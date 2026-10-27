@@ -53,7 +53,9 @@ private func runFile(path: String = filePathWithQuotes, direct: ApprovedDirectTa
             (() => {
             var sends = 0;
             function Path(p) { return { path: p }; }
-            const stub = { running: () => true, chats: { byId: (tid) => () => { \(lookup) } },
+            // Accounts and participants would happily send; a file-mode script must never reach them.
+            const stub = { running: () => true, accounts: () => [{ serviceType: () => 'SMS', enabled: () => true,
+                    participants: { byName: (n) => ({ handle: () => n }) } }], chats: { byId: (tid) => () => { \(lookup) } },
                 send: (arg, options) => { sends++; if (arg.path !== \(try jsonStringify(path))) throw new Error('path changed'); } };
             function Application(pid) { return stub; }
             const diagnostic = \(source);
@@ -76,6 +78,20 @@ private func runFile(path: String = filePathWithQuotes, direct: ApprovedDirectTa
     #expect(mismatched.stage == .targetLookup && mismatched.sends == 0)
     let unproven = try runFile(direct: nil, lookup: "return { id: () => tid };")
     #expect(unproven.stage == .targetLookup && unproven.sends == 0)
+}
+
+@Test func approvedFileScriptHasNoParticipantFallbackAndUnloadedChatSendsNothing() throws {
+    let file = try OSA.approvedSendScript(threadID: fileGUID, text: nil, direct: fileDirect,
+                                          filePath: filePathWithQuotes, processIdentifier: 424242)
+    for forbidden in ["participants", "accounts", "byName", "direct.handle", "enabled()"] { #expect(!file.contains(forbidden)) }
+    #expect(file.contains("Messages.chats.byId(tid)()") && file.contains("to.id() !== tid"))
+    // Text keeps its documented unloaded-chat fallback unchanged.
+    let text = try OSA.approvedSendScript(threadID: fileGUID, text: "hi", direct: fileDirect, processIdentifier: 424242)
+    #expect(text.contains("participants.byName(direct.handle)") && text.contains("-1728"))
+    let unloaded = try runFile(lookup: "const e = new Error('unloaded'); e.errorNumber = -1728; throw e;")
+    #expect(unloaded.stage == .targetLookup && unloaded.sends == 0)
+    let absent = try runFile(lookup: "return null;")
+    #expect(absent.stage == .targetLookup && absent.sends == 0)
 }
 
 @Test func approvedFilePathValidationRejectsBeforeAnyDispatch() throws {
