@@ -1,6 +1,45 @@
 import SQLite
 
+/// Raw attachment columns for one message. Sensitive; never log.
+public struct ApprovedAttachmentRow: Sendable, Equatable {
+    public let guid: String
+    public let filename: String?
+    public let transferName: String?
+    public let totalBytes: Int
+    public let transferState: Int
+    public let isOutgoing: Bool
+    public let mimeType: String?
+
+    public init(guid: String, filename: String?, transferName: String?, totalBytes: Int,
+                transferState: Int, isOutgoing: Bool, mimeType: String?) {
+        self.guid = guid; self.filename = filename; self.transferName = transferName
+        self.totalBytes = totalBytes; self.transferState = transferState
+        self.isOutgoing = isOutgoing; self.mimeType = mimeType
+    }
+}
+
 public extension IMDatabase {
+    /// Read-only join through message_attachment_join, in attachment ROWID order.
+    func approvedAttachmentRows(messageRowID: Int) throws -> [ApprovedAttachmentRow] {
+        let statement = try cachedStatement(forEscapedSQL: """
+        SELECT a.guid, a.filename, a.transfer_name, a.total_bytes, a.transfer_state, a.is_outgoing, a.mime_type
+        FROM message_attachment_join AS maj
+        INNER JOIN attachment AS a ON a.ROWID = maj.attachment_id
+        WHERE maj.message_id = ?
+        ORDER BY a.ROWID ASC
+        """).reset()
+        try statement.bind(messageRowID)
+        return try statement.mapRowsUntilDone { row in
+            ApprovedAttachmentRow(
+                guid: try row[0].expect(String.self), filename: try row[1].optionalConverting(String.self),
+                transferName: try row[2].optionalConverting(String.self),
+                totalBytes: try row[3].optionalConverting(Int.self) ?? 0,
+                transferState: try row[4].optionalConverting(Int.self) ?? 0,
+                isOutgoing: try row[5].optionalConverting(Int.self) == 1,
+                mimeType: try row[6].optionalConverting(String.self))
+        }
+    }
+
     /// Stable insertion-order traversal. Fetch at most one lookahead row.
     func approvedThreadRows(beforeRowID: Int?, limit: Int) throws -> [(rowID: Int, guid: String, title: String?, isUnread: Bool)] {
         let statement = try cachedStatement(forEscapedSQL: """

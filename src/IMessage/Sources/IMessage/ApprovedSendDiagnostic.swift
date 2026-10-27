@@ -78,12 +78,14 @@ public struct ApprovedDirectChat: Sendable, Equatable {
     }
 }
 
-/// Encodes as the JSON array `[threadID, text, direct, newRecipient]`, with null for absent values.
+/// Encodes as the JSON array `[threadID, text, direct, newRecipient, filePath]`, with null for absent values.
+/// A non-null `filePath` selects file mode, which always sends and never reports a no-op as complete.
 private struct ApprovedScriptArguments: Encodable {
     let threadID: String
     let text: String?
     let direct: ApprovedDirectTarget?
     let newRecipient: Bool
+    let filePath: String?
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.unkeyedContainer()
@@ -91,6 +93,7 @@ private struct ApprovedScriptArguments: Encodable {
         if let text { try container.encode(text) } else { try container.encodeNil() }
         if let direct { try container.encode(direct) } else { try container.encodeNil() }
         try container.encode(newRecipient)
+        if let filePath { try container.encode(filePath) } else { try container.encodeNil() }
     }
 }
 
@@ -118,6 +121,7 @@ extension OSA {
     /// Internal closures provide an offline seam; production uses the same gate and program.
     static func approvedSend(
         threadID: String, text: String?, direct: ApprovedDirectTarget? = nil, newRecipient: Bool = false,
+        filePath: String? = nil,
         permissionCheck: () throws -> ApprovedOSATarget = approvedSendPermission,
         execute: (String, ApprovedOSATarget) throws -> String = { try executeApprovedScript($0, target: $1) }
     ) throws -> ApprovedSendDiagnostic {
@@ -129,12 +133,17 @@ extension OSA {
         guard newRecipient ? threadID.isEmpty && direct != nil : !threadID.isEmpty else {
             throw ApprovedSendDiagnostic(stage: .targetLookup)
         }
+        if let filePath {
+            // A file goes only to a chat proven direct, never to a new recipient, and never with text.
+            guard direct != nil, !newRecipient, text == nil else { throw ApprovedSendDiagnostic(stage: .targetLookup) }
+            guard filePath.hasPrefix("/") else { throw ApprovedSendDiagnostic(stage: .script) }
+        }
         guard target.processIdentifier > 0, target.isRunning() else {
             throw ApprovedSendDiagnostic(stage: .permission, appleEventCode: -600)
         }
         do {
             let source = try approvedSendScript(threadID: threadID, text: text, direct: direct, newRecipient: newRecipient,
-                                                processIdentifier: target.processIdentifier)
+                                                filePath: filePath, processIdentifier: target.processIdentifier)
             let result = try execute(source, target)
             guard let data = result.data(using: .utf8),
                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -166,15 +175,20 @@ extension OSA {
     }
 
     static func approvedSendScript(threadID: String, text: String?, direct: ApprovedDirectTarget? = nil,
-                                   newRecipient: Bool = false, processIdentifier: pid_t) throws -> String {
+                                   newRecipient: Bool = false, filePath: String? = nil,
+                                   processIdentifier: pid_t) throws -> String {
+        // File mode must always reach a send statement; an empty path can never become a no-op.
+        if let filePath, filePath.isEmpty { throw ApprovedSendDiagnostic(stage: .script) }
+        let sendStatement = filePath != nil ? "stage = 'send'; Messages.send(Path(fp), { to });"
+            : text == nil ? "" : "stage = 'send'; Messages.send(txt, { to });"
         // JSON literals preserve the full GUID and text without service normalization or interpolation.
         let arguments = try jsonStringify(ApprovedScriptArguments(threadID: threadID, text: text, direct: direct,
-                                                                       newRecipient: newRecipient))
+                                                                       newRecipient: newRecipient, filePath: filePath))
             .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
             .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
         return """
         (() => {
-            const [tid, txt, direct, fresh] = \(arguments);
+            const [tid, txt, direct, fresh, fp] = \(arguments);
             let stage = 'script';
             try {
                 stage = 'permission';
@@ -182,6 +196,8 @@ extension OSA {
                 if (!Messages.running()) return JSON.stringify({stage, appleEventCode: -600});
                 stage = 'target_lookup';
                 let to, missing = false;
+                if (fp !== null && (typeof fp !== 'string' || fp === '' || fp[0] !== '/' || fresh === true ||
+                                    direct === null || txt !== null)) return JSON.stringify({stage});
                 if (fresh === true) {
                     // A first-time recipient has no chat to look up; only its participant may be used.
                     if (direct === null || tid !== '') return JSON.stringify({stage});
@@ -205,7 +221,7 @@ extension OSA {
                     to = accounts[0].participants.byName(direct.handle);
                     if (to.handle() !== direct.handle) return JSON.stringify({stage});
                 }
-                \(text == nil ? "" : "stage = 'send'; Messages.send(txt, { to });")
+                \(sendStatement)
                 return JSON.stringify({stage: 'complete'});
             } catch (error) {
                 let code;
